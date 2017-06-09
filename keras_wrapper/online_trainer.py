@@ -24,6 +24,36 @@ class OnlineTrainer:
         self.index2word_y = self.dataset.vocabulary[params_prediction['dataset_outputs'][0]]['idx2words']
         self.mapping = None if self.dataset.mapping == dict() else self.dataset.mapping
 
+    def train_on_sample(self, model, train_inputs, iter_k=1):
+        weights = model.trainable_weights
+        weights.sort(key=lambda x: x.name if x.name else x.auto_name)
+        model.optimizer.set_weights(weights)
+        y = train_inputs[3]
+        for k in range(iter_k):
+            loss_val = model.evaluate(train_inputs,
+                                      np.zeros((y.shape[0], 1), dtype='float32'),
+                                      batch_size=1, verbose=0)
+            loss = 1.0 if loss_val > 0 else 0.0
+            model.optimizer.loss_value.set_value(loss)
+            model.fit(train_inputs,
+                      np.zeros((y.shape[0], 1), dtype='float32'),
+                      batch_size=min(self.params_training['batch_size'], len(train_inputs[0])),
+                      nb_epoch=self.params_training['n_epochs'],
+                      verbose=self.params_training['verbose'],
+                      callbacks=[],
+                      validation_data=None,
+                      validation_split=self.params_training.get('val_split', 0.),
+                      shuffle=self.params_training['shuffle'],
+                      class_weight=None,
+                      sample_weight=None,
+                      initial_epoch=0)
+            """
+            Only for debugging
+            model.evaluate(train_inputs,
+                           np.zeros((y.shape[0], 1), dtype='float32'),
+                           batch_size=1, verbose=0)
+            """
+
     def sample_and_train_online(self, X, Y, src_words=None):
         x = X[0]
         state_below_y = X[1]
@@ -67,35 +97,8 @@ class OnlineTrainer:
         # 3. Update net parameters with the corrected samples
         for model in self.models:
             if self.params_training.get('use_custom_loss', False):
-                weights = model.trainable_weights
-                weights.sort(key=lambda x: x.name if x.name else x.auto_name)
-                model.optimizer.set_weights(weights)
-                for k in range(1):
-                    train_inputs = [x, state_below_y, state_below_h] + [y, hyp]
-
-                    loss_val = model.evaluate(train_inputs,
-                                              np.zeros((y.shape[0], 1), dtype='float32'),
-                                              batch_size=1, verbose=0)
-                    loss = 1.0 if loss_val > 0 else 0.0
-                    model.optimizer.loss_value.set_value(loss)
-                    model.fit(train_inputs,
-                              np.zeros((y.shape[0], 1), dtype='float32'),
-                              batch_size=min(self.params_training['batch_size'], len(x)),
-                              nb_epoch=self.params_training['n_epochs'],
-                              verbose=self.params_training['verbose'],
-                              callbacks=[],
-                              validation_data=None,
-                              validation_split=self.params_training.get('val_split', 0.),
-                              shuffle=self.params_training['shuffle'],
-                              class_weight=None,
-                              sample_weight=None,
-                              initial_epoch=0)
-                    """
-                    Only for debugging
-                    model.evaluate(train_inputs,
-                                   np.zeros((y.shape[0], 1), dtype='float32'),
-                                   batch_size=1, verbose=0)
-                    """
+                train_inputs = [x, state_below_y, state_below_h, y, hyp]
+                self.train_on_sample(model, train_inputs, iter_k=2)
             else:
                 p = copy.copy(self.params_training)
                 del p['use_custom_loss']
