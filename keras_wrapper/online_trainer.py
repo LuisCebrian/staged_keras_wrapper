@@ -7,6 +7,7 @@ import copy
 
 
 class OnlineTrainer:
+
     def __init__(self, models, dataset, sampler, params_prediction, params_training, verbose=0):
         """
 
@@ -20,10 +21,13 @@ class OnlineTrainer:
         self.verbose = verbose
         self.params_prediction = self.checkParameters(params_prediction)
         self.params_training = self.checkParameters(params_training, params_training=True)
-
         self.index2word_y = self.dataset.vocabulary[params_prediction['dataset_outputs'][0]]['idx2words']
         self.mapping = None if self.dataset.mapping == dict() else self.dataset.mapping
-
+        self.n_updates = 0
+        if self.params_prediction['n_best_optimizer']:
+            from pycocoevalcap.sentence_bleu.sentence_bleu import SentenceBleuScorer
+            self.sentence_scorer = SentenceBleuScorer('')
+    
     def train_on_sample(self, model, train_inputs, iter_k=1):
         weights = model.trainable_weights
         weights.sort(key=lambda x: x.name if x.name else x.auto_name)
@@ -54,13 +58,18 @@ class OnlineTrainer:
                            batch_size=1, verbose=0)
             """
 
-    def sample_and_train_online(self, X, Y, src_words=None):
+    def sample_and_train_online(self, X, Y, src_words=None, trg_words=None):
         x = X[0]
         state_below_y = X[1]
         y = Y[0]
 
         # 1. Generate a sample with the current model
-        trans_indices, costs, alphas = self.sampler.sample_beam_search(x[0])
+        if self.params_prediction['n_best_optimizer']:
+            self.sentence_scorer.set_reference(str(trg_words[0]).split())
+            [trans_indices, costs, alphas], n_best = self.sampler.sample_beam_search(x[0])
+
+        else:
+            trans_indices, costs, alphas = self.sampler.sample_beam_search(x[0])
         state_below_h = np.asarray([np.append(self.dataset.extra_words['<null>'], trans_indices[:-1])])
 
         if self.params_training.get('use_custom_loss', False):
@@ -93,17 +102,87 @@ class OnlineTrainer:
             if self.verbose > 1:
                 logging.info('Hypothesis: %s' % str(hypothesis_to_write))
 
-        # 2. Post-edit this sample in order to match the reference --> Use y
-        # 3. Update net parameters with the corrected samples
-        for model in self.models:
-            if self.params_training.get('use_custom_loss', False):
-                train_inputs = [x, state_below_y, state_below_h, y, hyp]
-                self.train_on_sample(model, train_inputs, iter_k=2)
-            else:
-                p = copy.copy(self.params_training)
-                del p['use_custom_loss']
-                del p['custom_loss']
-                model.trainNetFromSamples([x, state_below_y], y, p)
+        if self.params_prediction['n_best_optimizer']:
+            if self.verbose > 0:
+                print ""
+                print "\tReference: ", trg_words[0]
+            for n_best_preds, n_best_scores, n_best_alphas in n_best:
+                n_best_predictions = []
+                for i, (n_best_pred, n_best_score, n_best_alpha) in enumerate(zip(n_best_preds,
+                                                                                n_best_scores,
+                                                                                n_best_alphas)):
+                    pred = decode_predictions_beam_search([n_best_pred],
+                                                          self.index2word_y,
+                                                          alphas=[n_best_alpha],
+                                                          x_text=sources,
+                                                          heuristic=heuristic,
+                                                          mapping=self.mapping,
+                                                          pad_sequences=True,
+                                                          verbose=0)
+                    # Apply detokenization function if needed
+                    if self.params_prediction.get('apply_detokenization', False):
+                        pred = map(self.params_prediction['detokenize_f'], pred)
+
+                    if self.sentence_scorer is not None:
+                        # We are always minimizing, therefore, we use 1 - BLEU as score.
+                        score = 1. - self.sentence_scorer.score(pred[0].split())
+                    else:
+                        score = n_best_score
+                    n_best_predictions.append([i, n_best_pred, pred, score])
+            for model in self.models:
+                weights = model.trainable_weights
+                weights.sort(key=lambda x: x.name if x.name else x.auto_name)
+                model.optimizer.set_weights(weights)
+                top_prob_h = np.asarray(n_best_predictions[0][1])
+                p = np.argsort([nbest[3] for nbest in n_best_predictions])
+                if p[0] == 0:
+                    if self.verbose > 0:
+                        print "The top-prob hypothesis and the top bleu hypothesis match"
+                else:
+                    if self.verbose:
+                        print "The top-prob hypothesis and the top bleu hypothesis don't match"
+                        print "top-prob h:", n_best_predictions[0][2][0], "Bleu:", 1-n_best_predictions[0][-1]
+                        print "top_bleu_h", n_best_predictions[p[0]][2][0], "Bleu:", 1-n_best_predictions[p[0]][-1]
+                        print "Updating..."
+
+                    top_bleu_h = np.asarray(n_best_predictions[p[0]][1])
+                    state_below_top_prob_h = np.asarray([np.append(self.dataset.extra_words['<null>'],
+                                                                   top_prob_h[:-1])])
+                    state_below_top_bleu_h = np.asarray([np.append(self.dataset.extra_words['<null>'],
+                                                                   top_bleu_h[:-1])])
+                    top_prob_h = np.array([indices_2_one_hot(top_prob_h,
+                                                             self.dataset.vocabulary_len["target_text"])])
+                    top_bleu_h = np.array([indices_2_one_hot(top_bleu_h,
+                                                             self.dataset.vocabulary_len["target_text"])])
+
+                    train_inputs = [x, state_below_top_bleu_h, state_below_top_prob_h] + [top_bleu_h, top_prob_h]
+                    model.optimizer.loss_value.set_value(1.0)
+                for k in range(3):
+                        model.fit(train_inputs,
+                                  np.zeros((state_below_top_prob_h.shape[0], 1), dtype='float32'),
+                                  batch_size=min(self.params_training['batch_size'], len(x)),
+                                  nb_epoch=self.params_training['n_epochs'],
+                                  verbose=self.params_training['verbose'],
+                                  callbacks=[],
+                                  validation_data=None,
+                                  validation_split=self.params_training.get('val_split', 0.),
+                                  shuffle=self.params_training['shuffle'],
+                                  class_weight=None,
+                                  sample_weight=None,
+                                  initial_epoch=0)
+                        self.n_updates += 1
+        else:
+            # 2. Post-edit this sample in order to match the reference --> Use y
+            # 3. Update net parameters with the corrected samples
+            for model in self.models:
+                if self.params_training.get('use_custom_loss', False):
+                    train_inputs = [x, state_below_y, state_below_h, y, hyp]
+                    self.train_on_sample(model, train_inputs, iter_k=2)
+                else:
+                    p = copy.copy(self.params_training)
+                    del p['use_custom_loss']
+                    del p['custom_loss']
+                    model.trainNetFromSamples([x, state_below_y], y, p)
 
     def checkParameters(self, input_params, params_training=False):
         """
@@ -131,12 +210,14 @@ class OnlineTrainer:
                                      'state_below_index': -1,
                                      'output_text_index': 0,
                                      'store_hypotheses': None,
+                                     'search_pruning': False,
                                      'pos_unk': False,
                                      'heuristic': 0,
                                      'mapping': None,
                                      'apply_detokenization': False,
                                      'normalize_probs': False,
-                                     'detokenize_f': 'detokenize_none'
+                                     'detokenize_f': 'detokenize_none',
+                                     'n_best_optimizer': False
                                      }
         default_params_training = {'batch_size': 1,
                                    'use_custom_loss': False,
@@ -177,3 +258,6 @@ class OnlineTrainer:
                 params[key] = default_val
 
         return params
+
+    def get_n_updates(self):
+        return self.n_updates

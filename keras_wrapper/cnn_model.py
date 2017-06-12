@@ -1483,6 +1483,7 @@ class Model_Wrapper(object):
             trans_indices = ranks_flat / voc_size  # index of row
             word_indices = ranks_flat % voc_size  # index of col
             costs = cand_flat[ranks_flat]
+            best_cost = costs[0]
             # Form a beam for the next iteration
             new_hyp_samples = []
             new_trans_indices = []
@@ -1490,12 +1491,21 @@ class Model_Wrapper(object):
             if ret_alphas:
                 new_hyp_alphas = []
             for idx, [ti, wi] in enumerate(zip(trans_indices, word_indices)):
-                new_hyp_samples.append(hyp_samples[ti] + [wi])
-                new_trans_indices.append(ti)
-                new_hyp_scores[idx] = copy.copy(costs[idx])
-                if ret_alphas:
-                    new_hyp_alphas.append(hyp_alphas[ti] + [alphas[ti]])
-
+                if params['search_pruning']:
+                    if costs[idx] < k * best_cost:
+                        new_hyp_samples.append(hyp_samples[ti] + [wi])
+                        new_trans_indices.append(ti)
+                        new_hyp_scores[idx] = copy.copy(costs[idx])
+                        if ret_alphas:
+                            new_hyp_alphas.append(hyp_alphas[ti] + [alphas[ti]])
+                    else:
+                        dead_k += 1
+                else:
+                    new_hyp_samples.append(hyp_samples[ti] + [wi])
+                    new_trans_indices.append(ti)
+                    new_hyp_scores[idx] = copy.copy(costs[idx])
+                    if ret_alphas:
+                        new_hyp_alphas.append(hyp_alphas[ti] + [alphas[ti]])
             # check the finished samples
             new_live_k = 0
             hyp_samples = []
@@ -1608,9 +1618,8 @@ class Model_Wrapper(object):
                           'sampling_type': 'max_likelihood',
                           'words_so_far': False,
                           'optimized_search': False,
+                          'search_pruning': False,
                           'pos_unk': False,
-                          'heuristic': 0,
-                          'mapping': None,
                           'temporally_linked': False,
                           'link_index_id': 'link_index',
                           'state_below_index': -1,
@@ -1863,9 +1872,8 @@ class Model_Wrapper(object):
                           'sampling_type': 'max_likelihood',
                           'words_so_far': False,
                           'optimized_search': False,
+                          'search_pruning': False,
                           'pos_unk': False,
-                          'heuristic': 0,
-                          'mapping': None,
                           'temporally_linked': False,
                           'link_index_id': 'link_index',
                           'state_below_index': -1,
@@ -2318,9 +2326,7 @@ class Model_Wrapper(object):
                           'optimized_search': False,
                           'state_below_index': -1,
                           'output_text_index': 0,
-                          'pos_unk': False,
-                          'heuristic': 0,
-                          'mapping': None
+                          'pos_unk': False
                           }
         params = self.checkParameters(self.params, default_params)
 
